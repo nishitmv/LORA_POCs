@@ -1,236 +1,100 @@
 import pandas as pd
 import random
 import string
-from faker import Faker
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def _random_cc_types(rng: random.Random, company_suffix: str, n: int = 15):
-    """
-    Generates distinct transaction types.
-    Adds a company_suffix (e.g., '_A') to ensure types are unique across companies.
-    """
-    prefixes = ['POS', 'ACH', 'Wire', 'Card', 'Tfr', 'Fee', 'Auto', 'Bill', 'Dbt', 'Crd']
-    out = set()
-    while len(out) < n:
-        p = rng.choice(prefixes)
-        # Random 2-3 char suffix
-        s = ''.join(rng.choices(string.ascii_uppercase, k=random.randint(2, 3)))
-        # Format: POS_XYZ_A (Guarantees Company A types != Company B types)
-        out.add(f"{p}_{s}_{company_suffix}")
-    return list(out)
-
-
-def _generate_target_pool(rng: random.Random, num_classes: int, company_id: str):
-    """
-    Generates a fixed pool of (cc_type, cc_code) pairs.
-    Both Type and Code are namespaced to the company to ensure global uniqueness.
-    """
-    # Create a short suffix from company_id (e.g., "COMPANY_A" -> "A")
-    comp_suffix = company_id.split('_')[-1] if '_' in company_id else company_id[:3]
-
-    # 1. Generate Types unique to this company
-    types = _random_cc_types(rng, comp_suffix, n=min(15, num_classes))
-
-    pool = set()
-    while len(pool) < num_classes:
-        t = rng.choice(types)
-        # 2. Generate Code unique to this company
-        # Format: COMP_A-849302
-        c_suffix = rng.randint(100000, 999999)
-        c = f"{company_id}-{c_suffix}"
-        pool.add((t, c))
-
-    return list(pool)
-
-
-def _get_description_patterns(company_id: str):
-    """
-    Returns a distinct list of description formats based on the company.
-    """
-    if "A" in company_id:
-        # Style: Dashes, Standard Prefixes (INV, REF)
-        return [
-            "POS - {merchant} - {cat} - INV#{inv}",
-            "CARD PURCH: {merchant} ({cat}) REF-{ref}",
-            "DD: {merchant} / {cat} / ORD {ord}",
-            "FEE: {merchant} {cat} ID:{acct}",
-            "ONLINE-TXN: {merchant} - {cat}",
-        ]
-    elif "B" in company_id:
-        # Style: Pipes, Hash signs, Short codes
-        return [
-            "{merchant} | {cat} | #{inv}",
-            "TXN | {merchant} | {cat} | Auth:{ref}",
-            "{cat} | {merchant} | {ord}",
-            "E-Bill | {merchant} | {cat} | #{acct}",
-            "Auto-Debit | {merchant} | {cat}",
-        ]
-    else:
-        # Style: Verbose, Sentence-like, Spaced out
-        return [
-            "Payment to {merchant} for {cat} services",
-            "Authorized txn at {merchant} ({cat}) ref {ref}",
-            "{merchant} {cat} purchase order {ord}",
-            "Recurring payment: {merchant} [{cat}]",
-            "{cat} charge from {merchant} ID {acct}",
-        ]
-
-
-def _make_description(fake: Faker, rng: random.Random, merchant_name: str, merchant_category: str, patterns: list):
-    p = rng.choice(patterns)
-    return p.format(
-        merchant=merchant_name.upper(),
-        cat=merchant_category.upper(),
-        inv=str(rng.randint(10000, 99999)),
-        ref=fake.bothify(text="??####"),
-        ord=fake.bothify(text="##-####"),
-        acct=str(rng.randint(100, 999)),
-    )
-
-
-def _pick_amount(rng: random.Random):
-    bucket = rng.random()
-    if bucket < 0.60:
-        amt = rng.uniform(10, 500)
-    elif bucket < 0.90:
-        amt = rng.uniform(500, 5000)
-    else:
-        amt = rng.uniform(5000, 50000)
-    if rng.random() < 0.05:
-        amt = -amt
-    return round(amt, 2)
-
-
-def _pick_currency(rng: random.Random):
-    currencies = ["INR", "USD", "EUR", "GBP"]
-    weights = [0.80, 0.10, 0.05, 0.05]
-    return rng.choices(currencies, weights=weights, k=1)[0]
-
-
-# -----------------------------
-# Main generator
-# -----------------------------
-def generate_company_dataset(
-        company_id: str,
-        num_records: int = 10000,
-        num_merchants: int = 800,
-        num_classes: int = 40,
-        seed: int | None = None
-):
+def generate_multi_company_dataset(companies: list, num_records_per_company: int = 10000, seed: int = 42):
     rng = random.Random(seed)
-    fake = Faker()
-    if seed is not None:
-        Faker.seed(seed)
 
-    # 1. Setup Merchants (Varying Industries)
-    base_industries = [
-        'Retail', 'Software', 'Logistics', 'Dining', 'Travel', 'Consulting',
-        'Healthcare', 'Manufacturing', 'Energy', 'Education', 'Real Estate',
-        'Media', 'Telecom', 'Construction', 'Finance', 'Legal'
-    ]
-    # Randomly select a subset of industries for this company
-    merchant_groups = rng.sample(base_industries, k=rng.randint(8, 12))
+    # Pre-define some fake company names
+    # We create a large pool so different companies pick different merchants
+    fake_merchant_names = [f"Merchant_{i}" for i in range(5000)]
 
-    merchant_categories = [
-        "Grocery", "Fuel", "Restaurant", "FastFood", "Pharmacy", "Hospital",
-        "Airlines", "Hotel", "Taxi", "Ecommerce", "Subscription", "Utilities",
-        "Electronics", "Apparel", "Entertainment", "Education"
-    ]
+    all_data = []
 
-    merchants = []
-    seen_merchants = set()
-    while len(merchants) < num_merchants:
-        grp = rng.choice(merchant_groups)
-        raw = fake.company()
-        # Add a random suffix to ensure merchant names are unique per company run
-        suffix = ''.join(rng.choices(string.ascii_lowercase, k=3))
-        name = f"{raw} {suffix}"
-        key = (grp, name)
-        if key not in seen_merchants:
-            seen_merchants.add(key)
-            merchants.append(key)
+    for company_id in companies:
+        print(f"Generating data for {company_id}...")
 
-    # 2. Generate the FIXED pool of 40 targets (Unique to this company)
-    valid_targets = _generate_target_pool(rng, num_classes, company_id)
+        # --- 1. Company-Specific Target Space ---
+        # Each company has its own set of 40 GL Codes and Transaction Types
+        # Format: COMP_A-123456 (Guarantees no overlap between companies)
+        targets = []
+        for _ in range(40):
+            code = f"{company_id}-{rng.randint(100000, 999999)}"
+            # Type suffix matches company ID to ensure uniqueness
+            suffix = company_id.split('_')[-1]  # "COMPANY_A" -> "A"
+            ctype = rng.choice(['POS', 'ONLINE', 'FEE', 'BILL', 'TRANSFER']) + f"_{suffix}"
+            targets.append((ctype, code))
 
-    # 3. Get Description Patterns (Unique to this company)
-    desc_patterns = _get_description_patterns(company_id)
+        # --- 2. Company-Specific Merchant Profiles (The Rules) ---
+        # Each company deals with a unique set of 200 merchants.
+        # We enforce this by sampling from the fake_merchant_names pool without replacement per company logic
+        # (or just pick random ones, collision probability is low, but let's be safe)
 
-    # Registry: Map (Inputs) -> (Target Class)
-    combo_registry = {}
+        company_merchants = rng.sample(fake_merchant_names, k=200)
 
-    data = []
-    for _ in range(num_records):
-        # Generate inputs
-        merchant_group, merchant_name = rng.choice(merchants)
-        merchant_category = rng.choice(merchant_categories)
-        amount = _pick_amount(rng)
-        currency = _pick_currency(rng)
+        profiles = []
+        for merchant_name in company_merchants:
+            # Generate static attributes for this merchant
+            # Unique suffix ensures even if "Merchant_1" appears in Company B, it's distinct like "Merchant_1 ABC"
+            distinct_name = merchant_name + " " + ''.join(rng.choices(string.ascii_uppercase, k=3))
 
-        # Description using company-specific patterns
-        description = _make_description(fake, rng, merchant_name, merchant_category, desc_patterns)
+            group = rng.choice(['Retail', 'Travel', 'Food', 'Tech', 'Utilities', 'Logistics', 'Consulting'])
+            category = rng.choice(['Store', 'Airline', 'Cafe', 'SaaS', 'Electric', 'Hotel', 'Uber'])
+            currency = rng.choice(['USD', 'EUR', 'INR', 'GBP'])
 
-        combo_key = (
-            merchant_category,
-            amount,
-            currency,
-            description,
-            merchant_name,
-            merchant_group
-        )
+            # ASSIGN RULE: This merchant maps to ONE specific target pair
+            # This makes the pattern learnable: Name -> Code
+            target = rng.choice(targets)
 
-        # Assign target (consistent per input combination)
-        if combo_key in combo_registry:
-            cc_type, cc_code = combo_registry[combo_key]
-        else:
-            # Randomly assign one of the 40 allowed targets
-            cc_type, cc_code = rng.choice(valid_targets)
-            combo_registry[combo_key] = (cc_type, cc_code)
+            profiles.append({
+                "merchant_name": distinct_name,
+                "merchant_group": group,
+                "merchant_category": category,
+                "currency": currency,
+                "cc_type": target[0],  # Truth
+                "cc_code": target[1]  # Truth
+            })
 
-        data.append({
-            "company_id": company_id,
-            "merchant_group": merchant_group,
-            "merchant_name": merchant_name,
-            "merchant_category": merchant_category,
-            "amount": amount,
-            "currency": currency,
-            "description": description,
-            "cc_type": cc_type,
-            "cc_code": cc_code,
-        })
+        # --- 3. Generate Records (Noise & Variation) ---
+        for _ in range(num_records_per_company):
+            # Pick a rule (profile)
+            profile = rng.choice(profiles)
 
-    df = pd.DataFrame(data)
+            # Vary the amount (Model must learn Amount is NOT the signal)
+            amount = round(rng.uniform(10, 5000), 2)
 
-    # Sanity Checks
-    # 1. Consistency Rule
-    key_cols = ["merchant_category", "amount", "currency", "description", "merchant_name", "merchant_group"]
-    assert df.groupby(key_cols)["cc_code"].nunique().max() == 1, "Consistency Rule Violated!"
+            # Vary description (Signal + Noise)
+            # "TXN Merchant_Name_ABC REF-12345"
+            noise = ''.join(rng.choices(string.digits + string.ascii_uppercase, k=8))
+            description = f"TXN {profile['merchant_name']} REF-{noise}"
 
-    return df
+            row = profile.copy()
+            row['company_id'] = company_id
+            row['amount'] = amount
+            row['description'] = description
+
+            all_data.append(row)
+
+    return pd.DataFrame(all_data)
 
 
-if __name__ == "__main__":
-    companies = ["COMPANY_A", "COMPANY_B", "COMPANY_C"]
+# Generate for 5 companies
+companies_list = ["COMPANY_A", "COMPANY_B", "COMPANY_C", "COMPANY_D", "COMPANY_E"]
+df_multi = generate_multi_company_dataset(companies_list, num_records_per_company=2000)
 
-    for i, cid in enumerate(companies, start=1):
-        print(f"--- Generating {cid} ---")
-        df = generate_company_dataset(
-            company_id=cid,
-            num_records=10000,
-            num_merchants=900,
-            num_classes=40,
-            seed=5000 + i
-        )
+# Save individual files
+for comp in companies_list:
+    subset = df_multi[df_multi['company_id'] == comp]
+    filename = f"{comp.lower()}_data.csv"
+    subset.to_csv(filename, index=False)
+    print(f"Saved {filename} ({len(subset)} rows)")
 
-        filename = f"{cid.lower()}_data.csv"
-        df.to_csv(filename, index=False)
+# Verification
+print("\n--- Verification ---")
+print(f"Total Rows: {len(df_multi)}")
+print(f"Unique GL Codes per Company: {df_multi.groupby('company_id')['cc_code'].nunique()}")
 
-        # Verify Uniqueness (Preview)
-        print(f"Examples of Descriptions ({cid}):")
-        print(df['description'].head(2).values)
-        print(f"Examples of Types ({cid}):")
-        print(df['cc_type'].unique()[:3])
-        print("-" * 30)
+# Check overlap (Should be 0)
+code_overlap = df_multi.groupby('cc_code')['company_id'].nunique()
+print(f"Codes appearing in >1 company: {len(code_overlap[code_overlap > 1])}")
