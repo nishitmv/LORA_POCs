@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[2]:
+# In[1]:
 
 
 import os
@@ -23,7 +23,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(device)
 
 
-# In[8]:
+# In[2]:
 
 
 def get_company_dataset(company, tokenizer, max_length=128, test_size=0.2):
@@ -57,6 +57,38 @@ def get_company_dataset(company, tokenizer, max_length=128, test_size=0.2):
     # We create a temporary 'stratify_col' to ensure both Type and Code distributions are preserved
     df['stratify_col'] = df['cc_type'].astype(str) + "_" + df['cc_code'].astype(str)
 
+
+    def bucketize_amount(amount):
+     try:
+        val = float(amount)
+        # Handle negative (refunds/credits) separately if needed
+        is_negative = val < 0
+        val = abs(val)
+
+        if val == 0:
+            bucket = "ZERO"
+        elif val < 10:
+            bucket = "XS"      # e.g., < $10 (Coffee, fast food)
+        elif val < 50:
+            bucket = "SMALL"   # e.g., $10-$50 (Groceries, gas)
+        elif val < 100:
+            bucket = "MEDIUM"  # e.g., $50-$100 (Utilities, clothes)
+        elif val < 500:
+            bucket = "LARGE"   # e.g., $100-$500 (Electronics, furniture)
+        elif val < 1000:
+            bucket = "XL"      # e.g., $500-$1000 (Rent, high-end)
+        else:
+            bucket = "XXL"     # e.g., > $1000 (B2B payments, salary)
+
+        prefix = "REFUND_" if is_negative else ""
+        return f"{prefix}{bucket}"
+     except (ValueError, TypeError):
+        return "UNKNOWN"
+
+# Usage in your preprocessing function:
+# Old: f"Amount: {amt} {curr}"
+# New: f"Amount: {bucketize_amount(amt)} {curr}"
+
     train_df, val_df = train_test_split(
         df,
         test_size=test_size,
@@ -82,7 +114,7 @@ def get_company_dataset(company, tokenizer, max_length=128, test_size=0.2):
     def preprocess_function(examples):
         # Manual concatenation for Qwen/LLMs
         inputs = [
-            f"Merchant: {name} | Group: {group} | Category: {cat} | Amount: {amt} | currency: {curr} "
+            f"Merchant: {name} | Group: {group} | Category: {cat} | Amount: {bucketize_amount(amt)} | currency: {curr} "
             for name, group, cat, amt, curr in zip(
                 examples["merchant_name"],
                 examples["merchant_group"],
@@ -304,11 +336,11 @@ def preprocess_logits_for_metrics(logits, labels):
     return logits
 
 
-# In[9]:
+# In[5]:
 
 
 model_id = "Qwen/Qwen2.5-0.5B"
-local_model_path = "./models/Qwen1.5-0.5B-Base"
+local_model_path = "./models/Qwen2.5-0.5B-Base"
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
 tokenizer.pad_token = tokenizer.eos_token
 
@@ -442,7 +474,7 @@ for company in companies:
     torch.cuda.empty_cache()
 
 
-# In[5]:
+# In[7]:
 
 
 model_id = "Qwen/Qwen2.5-0.5B"
@@ -465,7 +497,7 @@ peft_config = LoraConfig(
 )
 
 
-# In[6]:
+# In[8]:
 
 
 import torch
@@ -728,7 +760,7 @@ print("\n=== Final Results Summary ===")
 print(results)
 
 
-# In[ ]:
+# In[8]:
 
 
 
