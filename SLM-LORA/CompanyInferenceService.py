@@ -1,20 +1,20 @@
 import os
+
 import pandas as pd
 import torch
-from flask import Flask, request, jsonify
 from datasets import Dataset
+from flask import Flask, request, jsonify
 from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoTokenizer, AutoConfig, AutoModel, Trainer, TrainingArguments
 from torch import nn
-from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoConfig, AutoModel, Trainer, TrainingArguments
 
 # Initialize Flask App
 app = Flask(__name__)
-local_model_path = "./model_assets/base_model"
+local_model_path = "./model_assets/Qwen2.5-0.5B-Base"
 
 
 print("Downloading model Qwen 2.5")
-model_id = "Qwen/Qwen2.5-1.5B"
+model_id = "Qwen/Qwen2.5-0.5B"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = AutoModel.from_pretrained(model_id)
 
@@ -24,7 +24,7 @@ model.save_pretrained(local_model_path)
 print(f"Model saved to {local_model_path}")
 
 # --- Configuration ---
-MODEL_ID = "./model_assets/base_model"
+MODEL_ID = "./model_assets/Qwen2.5-0.5B-Base"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Global Tokenizer
@@ -36,62 +36,111 @@ except Exception as e:
     tokenizer = None
 
 # --- Model Definition (Fixed Forward Pass) ---
+from transformers import AutoModelForCausalLM
+
+
 class QwenMultiHeadClassifier(nn.Module):
-    def __init__(self, model_id, num_type_labels, num_code_labels, lora_config=None):
+    def __init__(self, model_id, num_type_labels, num_code_labels,  lora_config=None):
         super().__init__()
-        self.config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        self.qwen = AutoModel.from_pretrained(
+        self.config = AutoConfig.from_pretrained(model_id)
+
+        self.qwen = AutoModelForCausalLM.from_pretrained(
             model_id,
             trust_remote_code=True,
             device_map=None
         )
-        # Note: LoRA config application is skipped here for inference simplicity,
-        # but you would load the adapter weights in a real deployment.
 
+
+        # print(f"VANILLA QWEN ARCHITECTURE : \n {self.qwen}")
+
+        if lora_config is not None:
+            self.qwen = get_peft_model(self.qwen, lora_config)
+
+            self.qwen.print_trainable_parameters()
+
+        # Two separate Head for Code and Type , hiodeen size of model , 1536 for Qwen .
 
         self.type_head = nn.Linear(self.config.hidden_size, num_type_labels)
         self.code_head = nn.Linear(self.config.hidden_size, num_code_labels)
 
+        self.type_head.weight.data.normal_(mean=0.0, std=0.001) # Tiny std dev
+        self.type_head.bias.data.zero_()
+
+        self.code_head.weight.data.normal_(mean=0.0, std=0.001)
+        self.code_head.bias.data.zero_()
+        # changing heads added to QWEN Data Type DFloat16
         self.type_head.to(self.qwen.dtype)
         self.code_head.to(self.qwen.dtype)
 
-    def forward(self, input_ids, attention_mask=None, **kwargs):
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def can_generate(self):
+            return False
+
+    def forward(self, input_ids, attention_mask=None,
+                labels_type=None, labels_code=None, labels=None, **kwargs):
+
+        if labels is not None:
+            labels_type = labels[:, 0]  # Assuming first col is type
+            labels_code = labels[:, 1]  # Assuming second col is code
+
         outputs = self.qwen(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True
         )
+        # Extract Last Token Embedding (EOS token), for LLMs, use Last Hidden State of last token
+        # shape : [batch, seq_length, hidden]
+        # AutoModelForCausalLM might not return 'last_hidden_state' attribute directly in some versions,
+        # but 'hidden_states' tuple is always there if output_hidden_states=True.
 
-        last_hidden_state = outputs.last_hidden_state
+        if hasattr(outputs, "last_hidden_state"):
+            last_hidden_state = outputs.last_hidden_state
+        else:
+            # Fallback: Get the last layer from the hidden_states tuple
+            last_hidden_state = outputs.hidden_states[-1]
 
-        # Extract Last Token Embedding
-        if self.config.pad_token_id is None:
-            # If no pad token, assume last token is the sequence end
+        #print( "Shape of last hidden state %",last_hidden_state.shape )
+        #Shape of last hidden state = torch.Size([32, 64, 1536])
+        # Get Embedding of last token for Classification
+        if self.config.pad_token_id is None:  # Fallback if no pad token
             sequence_lengths = -1
         else:
-            if input_ids is not None:
-                # Find index of last non-padding token
-                # shape: [batch_size]
+            if input_ids is not None:  # Find last non paddign token
                 sequence_lengths = (torch.ne(input_ids, self.config.pad_token_id).sum(-1) - 1).to(
                     last_hidden_state.device)
             else:
                 sequence_lengths = -1
 
-        # Gather the vectors at the sequence_lengths indices
-        if isinstance(sequence_lengths, int) and sequence_lengths == -1:
-            # Take the last token in the sequence
-            pooled_output = last_hidden_state[:, -1, :]
-        else:
-            batch_size = last_hidden_state.shape[0]
-            pooled_output = last_hidden_state[
-                torch.arange(batch_size, device=last_hidden_state.device), sequence_lengths]
+        # Get the Vector for last token in the sequence using sequence lenght calced above
+        #last_hidden_state shape: (Batch_Size, Sequence_Length, Hidden_Size)
+        # last_hidden_state[0] = batch size
+        # sequence_lengths contains last token indexes for each sequence .
+        # Last token is sequence is like CLS token it has learnt about the sequence
+        pooled_output = last_hidden_state[torch.arange(last_hidden_state.shape[0]), sequence_lengths]
 
-        # Classification Heads
+        # Pass it to the linear layers like we do CLS Token in Transforemrs
         logits_type = self.type_head(pooled_output)
         logits_code = self.code_head(pooled_output)
 
-        return logits_type, logits_code
+        loss = None
+
+        if labels_type is not None and labels_code is not None:
+            loss_type = self.loss_fn(logits_type, labels_type)
+            loss_code = self.loss_fn(logits_code, labels_code)
+            loss = 2 * loss_type + 1 * loss_code
+        else:
+            loss = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+
+        # Form output that can work with Huggingface trainer
+        output = {
+            "logits": (logits_type, logits_code)
+        }
+
+        return loss, logits_type, logits_code
+
+
 
 
 # --- Internal Helper: Data Loading ---
@@ -106,7 +155,7 @@ def _get_company_dataset(data_file_path, tokenizer, max_length=64):
     df = pd.read_csv(data_file_path)
 
     # 2. Strict Column Filtering
-    required_cols = ['merchant_group', 'merchant_name']
+    required_cols = ['merchant_group', 'merchant_name','merchant_category', 'amount', 'currency']
     # Filter to keep ONLY the required columns, ignoring everything else
     # We use intersection to be safe, or direct selection if we enforce existence
     df = df[required_cols]
@@ -115,25 +164,38 @@ def _get_company_dataset(data_file_path, tokenizer, max_length=64):
     dataset = Dataset.from_pandas(df, preserve_index=False)
 
     def preprocess_function(examples):
-        inputs = [f"{g} | {n}" for g, n in zip(examples["merchant_group"], examples["merchant_name"])]
+        # Manual concatenation for Qwen/LLMs
+        inputs = [
+            f"Merchant: {name} | Group: {group} | Category: {cat} | Amount: {amt} | currency: {curr} "
+            for name, group, cat, amt, curr in zip(
+                examples["merchant_name"],
+                examples["merchant_group"],
+                examples["merchant_category"],
+                examples["amount"],
+                examples["currency"],
+            )
+        ]
+
         tokenized_inputs = tokenizer(
-            inputs,
+            inputs,  # Single list of strings
             truncation=True,
             max_length=max_length,
-            padding="max_length"
+            padding="max_length"  # Or False if using DataCollator
         )
-        # Note: For inference, we don't strictly need labels in the dataset object
-        # unless we are evaluating accuracy. We include them here as the prompt
-        # implies the file has them, but the prediction loop will ignore them.
+
+        #tokenized_inputs["labels_type"] = examples["cc_type_id"]
+        #tokenized_inputs["labels_code"] = examples["cc_code_id"]
         return tokenized_inputs
+
+
 
     # Remove text columns to leave only tensors
     remove_cols = dataset.column_names
     dataset = dataset.map(preprocess_function, batched=True, remove_columns=remove_cols)
-
+    target_columns = ["input_ids", "attention_mask"]
     # Set format for PyTorch
     # We only need input_ids and attention_mask for inference
-    dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    dataset.set_format(type="torch", columns=target_columns)
 
     return dataset
 
@@ -147,8 +209,8 @@ def load_model_for_company(company, dataset):
         # normal classification this would have been SEQ_CLS
         # classification heads are external to the PEFT wrapper here
         task_type=TaskType.FEATURE_EXTRACTION,
-        r=8,  # 16 RANk is good , LORA Mattrices will be A X R and R X B .
-        lora_alpha=16,
+        r=16,  # 16 RANk is good , LORA Mattrices will be A X R and R X B .
+        lora_alpha=32,
         # Scales Output of Lora adapter by Alpha / Rank . ( 32/16 for us) , Makes learnt weights LOUDER compared to base model weights .
         # Scale of 2 is good .
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
@@ -156,9 +218,7 @@ def load_model_for_company(company, dataset):
         # MLP Layers are gate_proj, up_proj, down_proj , but results in very large number of paramters to learn but also gives huge accuracy benefit .
         lora_dropout=0.05  # Prevents overfittig whern data sizes are small like our company data case.
     )
-    # Dummy dimensions (replace with actual logic to fetch metadata for the company)
-    num_type_labels = 10
-    num_code_labels = 20
+
     model = QwenMultiHeadClassifier(
         model_id=MODEL_ID,
         num_type_labels=2,  # Dummy
@@ -173,7 +233,7 @@ def load_model_for_company(company, dataset):
     # Move to GPU once
     model.to("cuda")
     print(f"QWEn Multihead with 2 linear heads :\n {model}")
-    adapter_path = f"./final_adapters_QWEN/{company}"
+    adapter_path = f"./final_adapters_QWEN_0_5_v2/{company}"
     adapter_name = f"adapter_{company}"
     try:
         # Load state dicts to cpu to inspect shapes
@@ -212,8 +272,11 @@ def load_model_for_company(company, dataset):
         return None
 
 def preprocess_logits_for_metrics(logits, labels):
+    # Ensure this returns a tuple/tensor, NOT None!
     if isinstance(logits, tuple):
-        return logits
+        return (logits[1], logits[2]) # (logits_type, logits_code)
+    # Fallback debug
+    print(f"DEBUG: preprocess received {type(logits)}")
     return logits
 
 
@@ -226,6 +289,7 @@ def predict():
     Input JSON: { "company": "CompanyA", "data_file_path": "./data/test.csv" }
     Output JSON: { "company": "CompanyA", "predictions": [ {"merchant_group": "...", "merchant_name": "...", "cc_type_id": 1, "cc_code_id": 5}, ... ] }
     """
+    #Val_Data_company_a.csv
     try:
         data = request.get_json()
         company = data.get('company')
@@ -284,6 +348,9 @@ def predict():
             results.append({
                 "merchant_group": str(original_df.iloc[idx]['merchant_group']),
                 "merchant_name": str(original_df.iloc[idx]['merchant_name']),
+                "merchant_category": str(original_df.iloc[idx]['merchant_category']),
+                "amount": str(original_df.iloc[idx]['amount']),
+                "currency": str(original_df.iloc[idx]['currency']),
                 "cc_type_id": int(pred_type_ids[idx]),
                 "cc_code_id": int(pred_code_ids[idx])
             })
